@@ -1,0 +1,968 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WebGazer Kid Calibration + Shape Test (Human + JSON Export)</title>
+
+    <script src="/static/webgazer.js" type="text/javascript"></script>
+
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background: #fff;
+        font-family: Arial, sans-serif;
+      }
+
+      canvas {
+        display: block;
+        background: #f0f0f0;
+      }
+
+      #banner {
+        position: fixed;
+        top: 10px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: rgba(255, 255, 255, 0.92);
+        border: 1px solid rgba(0, 0, 0, 0.12);
+        padding: 8px 12px;
+        border-radius: 10px;
+        font-size: 14px;
+        z-index: 3000;
+        display: none;
+        user-select: none;
+        max-width: 90vw;
+        text-align: center;
+      }
+
+      #gazeDot {
+        position: fixed;
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: red;
+        pointer-events: none;
+        z-index: 4000;
+        display: none;
+        left: 0;
+        top: 0;
+      }
+
+      #exportBox {
+        position: fixed;
+        inset: 0;
+        background: rgba(255, 255, 255, 0.96);
+        z-index: 9999;
+        display: none;
+        padding: 14px;
+        box-sizing: border-box;
+      }
+
+      #exportBox h3 {
+        margin: 0 0 8px 0;
+        font-size: 16px;
+      }
+
+      #exportBox textarea {
+        width: 100%;
+        height: calc(100% - 46px);
+        resize: none;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+          "Courier New", monospace;
+        font-size: 12px;
+        padding: 10px;
+        box-sizing: border-box;
+      }
+
+      #exportBox button {
+        margin-top: 8px;
+        padding: 10px 12px;
+        font-size: 14px;
+        cursor: pointer;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="banner"></div>
+    <div id="gazeDot"></div>
+    <canvas id="canvas"></canvas>
+
+    <div id="exportBox">
+      <h3>Results + Raw Export</h3>
+      <textarea id="exportText" readonly></textarea>
+      <button id="closeExport">Close</button>
+    </div>
+
+    <script>
+      window.addEventListener("load", async () => {
+        // ----------------------------
+        // Config
+        // ----------------------------
+        const DEBUG = true;
+
+        // Calibration timings (kid-friendly)
+        const CAL_POINT_TOTAL_MS = 850;
+        const CAL_POINT_WARMUP_MS = 240;
+        const CAL_SAMPLE_EVERY_MS = 35;
+
+        // Validation timings
+        const VAL_POINT_TOTAL_MS = 850;
+        const VAL_POINT_WARMUP_MS = 240;
+        const VAL_MAX_MEAN_ERROR_PX = 165;
+
+        // Test scoring (AOI)
+        const AOI_RADIUS_PX = 150;
+        const AOI_RADIUS_TRIANGLE_PX = 175;
+        const RUN_SECONDS = 5;
+
+        // Engagement gate for trials
+        const MIN_STABLE_SAMPLES = 18;
+        const MIN_INSIDE_CANVAS_RATE = 0.55;
+
+        // Motion
+        const speed = 3;
+        const shapeSize = 90;
+
+        const colors = ["orange", "red", "purple"];
+
+        // Micro-calibration during task (drift reduction)
+        const MICRO_CALIBRATE = true;
+        const MICRO_EVERY_MS = 240;
+
+        // ----------------------------
+        // DOM + Canvas
+        // ----------------------------
+        const canvas = document.getElementById("canvas");
+        const ctx = canvas.getContext("2d");
+        const banner = document.getElementById("banner");
+        const gazeDot = document.getElementById("gazeDot");
+
+        const exportBox = document.getElementById("exportBox");
+        const exportText = document.getElementById("exportText");
+        const closeExport = document.getElementById("closeExport");
+        closeExport.addEventListener("click", () => (exportBox.style.display = "none"));
+
+        function resizeCanvas() {
+          canvas.width = window.innerWidth;
+          canvas.height = window.innerHeight;
+        }
+        window.addEventListener("resize", resizeCanvas);
+        resizeCanvas();
+
+        function setBanner(text, show = true) {
+          banner.textContent = text;
+          banner.style.display = show ? "block" : "none";
+        }
+
+        function sleep(ms) {
+          return new Promise((r) => setTimeout(r, ms));
+        }
+
+        function clamp(v, min, max) {
+          return Math.max(min, Math.min(max, v));
+        }
+
+        function pageToCanvas(px, py) {
+          const rect = canvas.getBoundingClientRect();
+          return {
+            x: px - rect.left,
+            y: py - rect.top,
+            inside:
+              px >= rect.left &&
+              px <= rect.right &&
+              py >= rect.top &&
+              py <= rect.bottom,
+          };
+        }
+
+        // ----------------------------
+        // Export structure
+        // ----------------------------
+        const EXPORT = {
+          meta: {
+            createdAt: new Date().toISOString(),
+            userAgent: navigator.userAgent,
+            viewport: { w: window.innerWidth, h: window.innerHeight },
+            config: {
+              CAL_POINT_TOTAL_MS,
+              CAL_POINT_WARMUP_MS,
+              CAL_SAMPLE_EVERY_MS,
+              VAL_POINT_TOTAL_MS,
+              VAL_POINT_WARMUP_MS,
+              VAL_MAX_MEAN_ERROR_PX,
+              AOI_RADIUS_PX,
+              AOI_RADIUS_TRIANGLE_PX,
+              RUN_SECONDS,
+              MIN_STABLE_SAMPLES,
+              MIN_INSIDE_CANVAS_RATE,
+              MICRO_CALIBRATE,
+              MICRO_EVERY_MS,
+            },
+          },
+          calibration: { passes: [] },
+          validation: { passes: [] },
+          trials: [],
+        };
+
+        // ----------------------------
+        // Human + CSV helpers (simple output for non-technical)
+        // ----------------------------
+        function pct(n) {
+          if (n === null || n === undefined || Number.isNaN(n)) return "N/A";
+          return `${Number(n).toFixed(1)}%`;
+        }
+
+        function fmt(n) {
+          if (n === null || n === undefined || Number.isNaN(n)) return "N/A";
+          return `${Number(n).toFixed(1)}`;
+        }
+
+        function humanReason(reason) {
+          if (!reason) return "";
+          if (reason === "not_enough_stable_samples") return "Tracking unstable (movement/lighting)";
+          if (reason === "gaze_offscreen_or_not_engaged") return "Not looking at the screen";
+          if (reason === "too_few_stable_samples") return "Too few stable gaze samples";
+          return reason;
+        }
+
+        function csvEscape(v) {
+          const s = String(v ?? "");
+          if (s.includes(",") || s.includes('"') || s.includes("\n")) {
+            return `"${s.replace(/"/g, '""')}"`;
+          }
+          return s;
+        }
+
+        function makeTrialCSV(EXPORT) {
+          const header = [
+            "trial",
+            "target",
+            "valid",
+            "reason",
+            "scorePercent",
+            "stableCount",
+            "stableInsideCanvasCount",
+            "stableInsideCanvasRate",
+            "insideCount",
+            "totalCount",
+          ];
+          const rows = [header.join(",")];
+
+          EXPORT.trials.forEach((t, i) => {
+            const s = t.summary;
+            const row = [
+              i + 1,
+              t.target,
+              t.valid,
+              humanReason(t.invalidReason),
+              s.scorePercent ?? "",
+              s.stableCount,
+              s.stableInsideCanvasCount,
+              s.stableInsideCanvasRate,
+              s.insideCount,
+              s.totalCount,
+            ].map(csvEscape);
+            rows.push(row.join(","));
+          });
+
+          return rows.join("\n");
+        }
+
+        function makeHumanSummary(EXPORT) {
+          const lines = [];
+          const lastVal = EXPORT.validation.passes[EXPORT.validation.passes.length - 1];
+
+          if (lastVal && typeof lastVal.meanErrPx === "number") {
+            lines.push(
+              `Validation mean error: ${fmt(lastVal.meanErrPx)} px (${lastVal.ok ? "OK" : "BAD"})`
+            );
+          } else {
+            lines.push("Validation mean error: N/A");
+          }
+
+          lines.push("");
+
+          EXPORT.trials.forEach((t, i) => {
+            const s = t.summary;
+            const onScreenPct = (s.stableInsideCanvasRate ?? 0) * 100;
+
+            if (t.valid) {
+              lines.push(
+                `Trial ${i + 1} (${t.target}): ${pct(s.scorePercent)} | stable samples: ${
+                  s.stableCount
+                } | on-screen: ${pct(onScreenPct)}`
+              );
+            } else {
+              lines.push(
+                `Trial ${i + 1} (${t.target}): INVALID (${humanReason(
+                  t.invalidReason
+                )}) | stable samples: ${s.stableCount} | on-screen: ${pct(onScreenPct)}`
+              );
+            }
+          });
+
+          lines.push("");
+          lines.push("If many trials are INVALID: use bright front lighting and keep camera at eye level.");
+          return lines.join("\n");
+        }
+
+        function showExport() {
+          const summary = makeHumanSummary(EXPORT);
+          const trialCSV = makeTrialCSV(EXPORT);
+          const json = JSON.stringify(EXPORT, null, 2);
+
+          exportText.value =
+            "HUMAN SUMMARY\n" +
+            "=============\n" +
+            summary +
+            "\n\nTRIAL CSV (copy into Google Sheets)\n" +
+            "==================================\n" +
+            trialCSV +
+            "\n\nJSON (full raw context)\n" +
+            "======================\n" +
+            json;
+
+          exportBox.style.display = "block";
+          console.log("EXPORT JSON:", EXPORT);
+        }
+
+        // ----------------------------
+        // Gaze filtering (median + EMA + jitter gate)
+        // ----------------------------
+        const GAZE = {
+          raw: [],
+          rawMax: 9,
+
+          sx: null,
+          sy: null,
+
+          hist: [],
+          histMax: 16,
+
+          medianWindow: 5,
+          emaAlpha: 0.18,
+          maxJumpPx: 240,
+
+          stableJitterPx: 20,
+          stableMinPts: 10,
+          stable: false,
+        };
+
+        function median(values) {
+          if (!values.length) return null;
+          const a = values.slice().sort((x, y) => x - y);
+          const mid = Math.floor(a.length / 2);
+          return a.length % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2;
+        }
+
+        function computeJitter(hist) {
+          if (hist.length < 2) return Infinity;
+          let sum = 0;
+          for (let i = 1; i < hist.length; i++) {
+            sum += Math.hypot(hist[i].x - hist[i - 1].x, hist[i].y - hist[i - 1].y);
+          }
+          return sum / (hist.length - 1);
+        }
+
+        function resetGazeFilter() {
+          GAZE.raw = [];
+          GAZE.sx = null;
+          GAZE.sy = null;
+          GAZE.hist = [];
+          GAZE.stable = false;
+        }
+
+        // For validation collection (page coords)
+        let collecting = false;
+        let collected = [];
+
+        // Start WebGazer
+        if (webgazer.clearData) webgazer.clearData();
+        resetGazeFilter();
+
+        webgazer.setGazeListener((data) => {
+          if (!data) return;
+
+          const x = clamp(data.x, 0, window.innerWidth);
+          const y = clamp(data.y, 0, window.innerHeight);
+
+          GAZE.raw.push({ x, y });
+          if (GAZE.raw.length > GAZE.rawMax) GAZE.raw.shift();
+
+          const w = Math.min(GAZE.medianWindow, GAZE.raw.length);
+          const recent = GAZE.raw.slice(-w);
+          const mx = median(recent.map((p) => p.x));
+          const my = median(recent.map((p) => p.y));
+          if (mx === null || my === null) return;
+
+          if (GAZE.sx === null) {
+            GAZE.sx = mx;
+            GAZE.sy = my;
+          }
+
+          const jump = Math.hypot(mx - GAZE.sx, my - GAZE.sy);
+          if (jump > GAZE.maxJumpPx) return;
+
+          GAZE.sx = GAZE.sx + (mx - GAZE.sx) * GAZE.emaAlpha;
+          GAZE.sy = GAZE.sy + (my - GAZE.sy) * GAZE.emaAlpha;
+
+          GAZE.hist.push({ x: GAZE.sx, y: GAZE.sy });
+          if (GAZE.hist.length > GAZE.histMax) GAZE.hist.shift();
+
+          if (GAZE.hist.length >= GAZE.stableMinPts) {
+            const jitter = computeJitter(GAZE.hist);
+            GAZE.stable = jitter <= GAZE.stableJitterPx;
+          } else {
+            GAZE.stable = false;
+          }
+
+          if (DEBUG) {
+            gazeDot.style.display = "block";
+            gazeDot.style.left = GAZE.sx - 5 + "px";
+            gazeDot.style.top = GAZE.sy - 5 + "px";
+          }
+
+          if (collecting) {
+            collected.push({
+              t: performance.now(),
+              x: GAZE.sx,
+              y: GAZE.sy,
+              stable: GAZE.stable,
+            });
+          }
+        });
+
+        webgazer.applyKalmanFilter(true);
+        await webgazer.begin();
+
+        if (DEBUG) {
+          webgazer.showVideo(fals);
+          webgazer.showPredictionPoints(true);
+        } else {
+          webgazer.showVideo(false);
+          webgazer.showPredictionPoints(false);
+        }
+
+        // ----------------------------
+        // Calibration target
+        // ----------------------------
+        function drawCalibrationTarget(x, y, tMs) {
+          const pulse = 0.5 + 0.5 * Math.sin((tMs / 1000) * Math.PI * 2);
+          const r = 26 + pulse * 10;
+
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          ctx.fillStyle = "#f0f0f0";
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+          // outer ring
+          ctx.beginPath();
+          ctx.arc(x, y, r + 10, 0, Math.PI * 2);
+          ctx.fillStyle = "#111";
+          ctx.fill();
+
+          // inner cutout
+          ctx.beginPath();
+          ctx.arc(x, y, r + 3, 0, Math.PI * 2);
+          ctx.fillStyle = "#f0f0f0";
+          ctx.fill();
+
+          // center
+          ctx.beginPath();
+          ctx.arc(x, y, r, 0, Math.PI * 2);
+          ctx.fillStyle = "#111";
+          ctx.fill();
+
+          // tiny dot
+          ctx.beginPath();
+          ctx.arc(x, y, 4, 0, Math.PI * 2);
+          ctx.fillStyle = "#f0f0f0";
+          ctx.fill();
+        }
+
+        async function runOnePassivePointWithLogging(passObj, pointIndex, targetX, targetY) {
+          const start = performance.now();
+          let lastTrain = 0;
+          let lastObs = 0;
+          const obsEvery = 33;
+
+          const pointObj = {
+            pointIndex,
+            target: { x: targetX, y: targetY },
+            startedAtMs: start,
+            trainingSamples: [],
+            observedSamples: [],
+          };
+          passObj.points.push(pointObj);
+
+          while (performance.now() - start < CAL_POINT_TOTAL_MS) {
+            const now = performance.now();
+            drawCalibrationTarget(targetX, targetY, now - start);
+
+            const elapsed = now - start;
+            const canTrain = elapsed >= CAL_POINT_WARMUP_MS;
+
+            if (canTrain && now - lastTrain >= CAL_SAMPLE_EVERY_MS) {
+              webgazer.recordScreenPosition(targetX, targetY, "move");
+              pointObj.trainingSamples.push({ t: now, x: targetX, y: targetY });
+              lastTrain = now;
+            }
+
+            if (now - lastObs >= obsEvery) {
+              const px = GAZE.sx;
+              const py = GAZE.sy;
+              const stable = GAZE.stable;
+
+              let err = null;
+              let insideCanvas = null;
+              let canvasX = null;
+              let canvasY = null;
+
+              if (px !== null) {
+                err = Math.hypot(px - targetX, py - targetY);
+                const local = pageToCanvas(px, py);
+                insideCanvas = local.inside;
+                if (insideCanvas) {
+                  canvasX = local.x;
+                  canvasY = local.y;
+                }
+              }
+
+              pointObj.observedSamples.push({
+                t: now,
+                gazePageX: px,
+                gazePageY: py,
+                stable,
+                errPx: err,
+                insideCanvas,
+                gazeCanvasX: canvasX,
+                gazeCanvasY: canvasY,
+              });
+
+              lastObs = now;
+            }
+
+            await new Promise((r) => requestAnimationFrame(r));
+          }
+
+          pointObj.endedAtMs = performance.now();
+        }
+
+        async function passiveCalibrationPass() {
+          setBanner("Look at the dot", true);
+
+          const w = canvas.width;
+          const h = canvas.height;
+
+          const points = [
+            { x: w * 0.18, y: h * 0.18 },
+            { x: w * 0.82, y: h * 0.18 },
+
+            { x: w * 0.50, y: h * 0.38 },
+            { x: w * 0.50, y: h * 0.50 },
+            { x: w * 0.50, y: h * 0.70 },
+
+            { x: w * 0.18, y: h * 0.82 },
+            { x: w * 0.82, y: h * 0.82 },
+          ];
+
+          resetGazeFilter();
+
+          const passObj = { startedAtMs: performance.now(), points: [] };
+          EXPORT.calibration.passes.push(passObj);
+
+          for (let i = 0; i < points.length; i++) {
+            await runOnePassivePointWithLogging(passObj, i, points[i].x, points[i].y);
+            await sleep(120);
+          }
+
+          passObj.endedAtMs = performance.now();
+          setBanner("", false);
+        }
+
+        async function validatePoint(targetX, targetY) {
+          collected = [];
+          collecting = false;
+
+          // warmup draw
+          const startWarm = performance.now();
+          while (performance.now() - startWarm < VAL_POINT_WARMUP_MS) {
+            drawCalibrationTarget(targetX, targetY, performance.now() - startWarm);
+            await new Promise((r) => requestAnimationFrame(r));
+          }
+
+          collecting = true;
+          const remain = VAL_POINT_TOTAL_MS - VAL_POINT_WARMUP_MS;
+          const start = performance.now();
+
+          while (performance.now() - start < remain) {
+            drawCalibrationTarget(targetX, targetY, performance.now() - start);
+            await new Promise((r) => requestAnimationFrame(r));
+          }
+
+          collecting = false;
+
+          const stableSamples = collected.filter((s) => s.stable);
+          if (stableSamples.length < 8) return null;
+
+          const meanDist =
+            stableSamples.reduce((sum, s) => sum + Math.hypot(s.x - targetX, s.y - targetY), 0) /
+            stableSamples.length;
+
+          return {
+            meanDist,
+            stableCount: stableSamples.length,
+            allCount: collected.length,
+            samples: collected.map((s) => ({
+              t: s.t,
+              gazePageX: s.x,
+              gazePageY: s.y,
+              stable: s.stable,
+              errPx: Math.hypot(s.x - targetX, s.y - targetY),
+            })),
+          };
+        }
+
+        async function validationPass() {
+          setBanner("Keep looking at the dot", true);
+
+          const w = canvas.width;
+          const h = canvas.height;
+
+          const valPoints = [
+            { x: w * 0.5, y: h * 0.5 },
+            { x: w * 0.5, y: h * 0.82 },
+            { x: w * 0.18, y: h * 0.18 },
+          ];
+
+          const passObj = { startedAtMs: performance.now(), points: [] };
+          EXPORT.validation.passes.push(passObj);
+
+          const dists = [];
+          for (let i = 0; i < valPoints.length; i++) {
+            const p = valPoints[i];
+            const result = await validatePoint(p.x, p.y);
+            if (result === null) {
+              setBanner("", false);
+              passObj.endedAtMs = performance.now();
+              passObj.ok = false;
+              passObj.reason = "too_few_stable_samples";
+              return { ok: false, mean: null, reason: "too_few_stable_samples" };
+            }
+
+            passObj.points.push({
+              index: i,
+              target: { x: p.x, y: p.y },
+              meanErrPx: result.meanDist,
+              stableCount: result.stableCount,
+              totalCount: result.allCount,
+              samples: result.samples,
+            });
+
+            dists.push(result.meanDist);
+            await sleep(120);
+          }
+
+          const mean = dists.reduce((a, b) => a + b, 0) / dists.length;
+
+          passObj.endedAtMs = performance.now();
+          passObj.ok = mean <= VAL_MAX_MEAN_ERROR_PX;
+          passObj.meanErrPx = mean;
+
+          setBanner("", false);
+          return { ok: mean <= VAL_MAX_MEAN_ERROR_PX, mean, reason: "mean_error" };
+        }
+
+        // ----------------------------
+        // Shapes
+        // ----------------------------
+        class Shape {
+          constructor(type, x, y, pathType) {
+            this.type = type;
+            this.x = x;
+            this.y = y;
+            this.size = shapeSize;
+            this.color = colors[Math.floor(Math.random() * colors.length)];
+            this.pathType = pathType;
+            this.vx = 0;
+            this.vy = 0;
+            this.setFixedVelocity();
+          }
+
+          setFixedVelocity() {
+            if (this.pathType === "horizontal") {
+              this.vx = speed;
+              this.vy = 0;
+            } else if (this.pathType === "vertical") {
+              this.vx = 0;
+              this.vy = speed;
+            } else {
+              this.vx = speed;
+              this.vy = speed;
+            }
+          }
+
+          update() {
+            this.x += this.vx;
+            this.y += this.vy;
+            if (this.x < 0 || this.x > canvas.width - this.size) this.vx *= -1;
+            if (this.y < 0 || this.y > canvas.height - this.size) this.vy *= -1;
+          }
+
+          getCenter() {
+            return { x: this.x + this.size / 2, y: this.y + this.size / 2 };
+          }
+
+          draw(isTarget) {
+            ctx.fillStyle = this.color;
+
+            if (this.type === "square") {
+              ctx.fillRect(this.x, this.y, this.size, this.size);
+            } else if (this.type === "circle") {
+              ctx.beginPath();
+              ctx.arc(
+                this.x + this.size / 2,
+                this.y + this.size / 2,
+                this.size / 2,
+                0,
+                Math.PI * 2
+              );
+              ctx.fill();
+            } else {
+              ctx.beginPath();
+              ctx.moveTo(this.x + this.size / 2, this.y);
+              ctx.lineTo(this.x, this.y + this.size);
+              ctx.lineTo(this.x + this.size, this.y + this.size);
+              ctx.closePath();
+              ctx.fill();
+            }
+
+            if (isTarget) {
+              ctx.save();
+              ctx.strokeStyle = "#111";
+              ctx.lineWidth = 5;
+              ctx.setLineDash([10, 10]);
+
+              if (this.type === "square") {
+                ctx.strokeRect(this.x - 4, this.y - 4, this.size + 8, this.size + 8);
+              } else if (this.type === "circle") {
+                ctx.beginPath();
+                ctx.arc(
+                  this.x + this.size / 2,
+                  this.y + this.size / 2,
+                  this.size / 2 + 8,
+                  0,
+                  Math.PI * 2
+                );
+                ctx.stroke();
+              } else {
+                ctx.beginPath();
+                ctx.moveTo(this.x + this.size / 2, this.y - 8);
+                ctx.lineTo(this.x - 8, this.y + this.size + 8);
+                ctx.lineTo(this.x + this.size + 8, this.y + this.size + 8);
+                ctx.closePath();
+                ctx.stroke();
+              }
+
+              ctx.setLineDash([]);
+              ctx.restore();
+            }
+          }
+        }
+
+        const shapes = [
+          new Shape("square", canvas.width * 0.12, canvas.height * 0.18, "horizontal"),
+          new Shape("circle", canvas.width * 0.45, canvas.height * 0.25, "vertical"),
+          // start triangle away from extreme corner
+          new Shape("triangle", canvas.width * 0.64, canvas.height * 0.60, "diagonal"),
+        ];
+
+        let running = false;
+        let targetIndex = 0;
+        let currentTarget = null;
+
+        let insideCount = 0;
+        let totalCount = 0;
+        let stableCount = 0;
+        let stableInsideCanvasCount = 0;
+
+        let lastMicro = 0;
+        let trialSamples = [];
+
+        function drawScene() {
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          shapes.forEach((s) => s.draw(s === currentTarget));
+        }
+
+        function animate() {
+          if (running) {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            shapes.forEach((s) => s.update());
+            shapes.forEach((s) => s.draw(s === currentTarget));
+
+            const now = performance.now();
+
+            const sample = {
+              t: now,
+              gazeStable: GAZE.stable,
+              gazePageX: GAZE.sx,
+              gazePageY: GAZE.sy,
+              gazeInsideCanvas: false,
+              gazeCanvasX: null,
+              gazeCanvasY: null,
+              distToTarget: null,
+              insideAOI: null,
+            };
+
+            if (currentTarget && GAZE.sx !== null) {
+              totalCount++;
+
+              if (GAZE.stable) {
+                stableCount++;
+
+                const local = pageToCanvas(GAZE.sx, GAZE.sy);
+                sample.gazeInsideCanvas = local.inside;
+
+                if (local.inside) {
+                  stableInsideCanvasCount++;
+                  sample.gazeCanvasX = local.x;
+                  sample.gazeCanvasY = local.y;
+
+                  const c = currentTarget.getCenter();
+                  const d = Math.hypot(local.x - c.x, local.y - c.y);
+                  sample.distToTarget = d;
+
+                  const radius =
+                    currentTarget.type === "triangle" ? AOI_RADIUS_TRIANGLE_PX : AOI_RADIUS_PX;
+
+                  const hit = d <= radius;
+                  sample.insideAOI = hit;
+
+                  if (hit) insideCount++;
+                }
+              }
+            }
+
+            trialSamples.push(sample);
+
+            if (MICRO_CALIBRATE && currentTarget) {
+              if (now - lastMicro >= MICRO_EVERY_MS) {
+                const c = currentTarget.getCenter();
+                webgazer.recordScreenPosition(c.x, c.y, "move");
+                lastMicro = now;
+              }
+            }
+          } else {
+            drawScene();
+          }
+
+          requestAnimationFrame(animate);
+        }
+
+        async function runTrial() {
+          currentTarget = shapes[targetIndex];
+          targetIndex = (targetIndex + 1) % shapes.length;
+
+          insideCount = 0;
+          totalCount = 0;
+          stableCount = 0;
+          stableInsideCanvasCount = 0;
+          trialSamples = [];
+
+          setBanner("Look at the outlined shape", true);
+
+          running = true;
+          const start = performance.now();
+          while (performance.now() - start < RUN_SECONDS * 1000) {
+            await sleep(20);
+          }
+          running = false;
+
+          setBanner("", false);
+
+          const insideRate = stableCount > 0 ? stableInsideCanvasCount / stableCount : 0;
+
+          let valid = true;
+          let invalidReason = null;
+
+          if (stableCount < MIN_STABLE_SAMPLES) {
+            valid = false;
+            invalidReason = "not_enough_stable_samples";
+          } else if (insideRate < MIN_INSIDE_CANVAS_RATE) {
+            valid = false;
+            invalidReason = "gaze_offscreen_or_not_engaged";
+          }
+
+          const pctScore = valid && totalCount > 0 ? (insideCount / totalCount) * 100 : null;
+          const score = pctScore === null ? null : Number(pctScore.toFixed(1));
+
+          EXPORT.trials.push({
+            startedAtMs: start,
+            endedAtMs: performance.now(),
+            target: currentTarget.type,
+            valid,
+            invalidReason,
+            summary: {
+              insideCount,
+              totalCount,
+              stableCount,
+              stableInsideCanvasCount,
+              stableInsideCanvasRate: Number(insideRate.toFixed(3)),
+              scorePercent: score,
+            },
+            samples: trialSamples,
+          });
+
+          setBanner(valid ? `Result: ${score}%` : `Result: INVALID`, true);
+          await sleep(900);
+          setBanner("", false);
+
+          currentTarget = null;
+          drawScene();
+        }
+
+        // ----------------------------
+        // Main flow
+        // ----------------------------
+        drawScene();
+        animate();
+
+        await passiveCalibrationPass();
+        let v = await validationPass();
+
+        if (!v.ok) {
+          await passiveCalibrationPass();
+          v = await validationPass();
+        }
+
+        webgazer.showVideo(false);
+        webgazer.showPredictionPoints(DEBUG);
+
+        setBanner("Click anywhere to start the test", true);
+
+        document.addEventListener(
+          "click",
+          async () => {
+            setBanner("", false);
+
+            for (let i = 0; i < 6; i++) {
+              await runTrial();
+              await sleep(250);
+            }
+
+            setBanner("Done (showing results)", true);
+            await sleep(300);
+
+            showExport();
+            setBanner("", false);
+          },
+          { once: true }
+        );
+      });
+    </script>
+  </body>
+</html>
