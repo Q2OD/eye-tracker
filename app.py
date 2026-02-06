@@ -12,4 +12,4 @@ def mediapipe_files(filename):
     return send_from_directory("static/mediapipe", filename)
 if __name__ == '__main__':
     # Runs the app in debug mode, accessible at http://127.0.0.1
-    app.run(debug=True, port=8924, host="0.0.0.0")
+    app.run(debug=True, port=5050, host="0.0.0.0")

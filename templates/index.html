@@ -69,7 +69,7 @@
 
       #exportBox textarea {
         width: 100%;
-        height: calc(100% - 46px);
+        height: calc(100% - 86px);
         resize: none;
         font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
           "Courier New", monospace;
@@ -78,8 +78,14 @@
         box-sizing: border-box;
       }
 
-      #exportBox button {
+      #exportBox .btnRow {
+        display: flex;
+        gap: 10px;
         margin-top: 8px;
+        flex-wrap: wrap;
+      }
+
+      #exportBox button {
         padding: 10px 12px;
         font-size: 14px;
         cursor: pointer;
@@ -95,7 +101,10 @@
     <div id="exportBox">
       <h3>Results + Raw Export</h3>
       <textarea id="exportText" readonly></textarea>
-      <button id="closeExport">Close</button>
+      <div class="btnRow">
+        <button id="switchColorsBtn">Switch color + run again</button>
+        <button id="closeExport">Close</button>
+      </div>
     </div>
 
     <script>
@@ -128,7 +137,13 @@
         const speed = 3;
         const shapeSize = 90;
 
+        // Only these colors, and ALL shapes share the same one
         const colors = ["orange", "red", "purple"];
+        let colorIndex = 0; // 0=orange,1=red,2=purple
+
+        function currentShapeColor() {
+          return colors[colorIndex % colors.length];
+        }
 
         // Micro-calibration during task (drift reduction)
         const MICRO_CALIBRATE = true;
@@ -145,6 +160,8 @@
         const exportBox = document.getElementById("exportBox");
         const exportText = document.getElementById("exportText");
         const closeExport = document.getElementById("closeExport");
+        const switchColorsBtn = document.getElementById("switchColorsBtn");
+
         closeExport.addEventListener("click", () => (exportBox.style.display = "none"));
 
         function resizeCanvas() {
@@ -183,31 +200,36 @@
         // ----------------------------
         // Export structure
         // ----------------------------
-        const EXPORT = {
-          meta: {
-            createdAt: new Date().toISOString(),
-            userAgent: navigator.userAgent,
-            viewport: { w: window.innerWidth, h: window.innerHeight },
-            config: {
-              CAL_POINT_TOTAL_MS,
-              CAL_POINT_WARMUP_MS,
-              CAL_SAMPLE_EVERY_MS,
-              VAL_POINT_TOTAL_MS,
-              VAL_POINT_WARMUP_MS,
-              VAL_MAX_MEAN_ERROR_PX,
-              AOI_RADIUS_PX,
-              AOI_RADIUS_TRIANGLE_PX,
-              RUN_SECONDS,
-              MIN_STABLE_SAMPLES,
-              MIN_INSIDE_CANVAS_RATE,
-              MICRO_CALIBRATE,
-              MICRO_EVERY_MS,
+        function newExport() {
+          return {
+            meta: {
+              createdAt: new Date().toISOString(),
+              userAgent: navigator.userAgent,
+              viewport: { w: window.innerWidth, h: window.innerHeight },
+              shapeColor: currentShapeColor(),
+              config: {
+                CAL_POINT_TOTAL_MS,
+                CAL_POINT_WARMUP_MS,
+                CAL_SAMPLE_EVERY_MS,
+                VAL_POINT_TOTAL_MS,
+                VAL_POINT_WARMUP_MS,
+                VAL_MAX_MEAN_ERROR_PX,
+                AOI_RADIUS_PX,
+                AOI_RADIUS_TRIANGLE_PX,
+                RUN_SECONDS,
+                MIN_STABLE_SAMPLES,
+                MIN_INSIDE_CANVAS_RATE,
+                MICRO_CALIBRATE,
+                MICRO_EVERY_MS,
+              },
             },
-          },
-          calibration: { passes: [] },
-          validation: { passes: [] },
-          trials: [],
-        };
+            calibration: { passes: [] },
+            validation: { passes: [] },
+            trials: [],
+          };
+        }
+
+        let EXPORT = newExport();
 
         // ----------------------------
         // Human + CSV helpers (simple output for non-technical)
@@ -285,6 +307,8 @@
             lines.push("Validation mean error: N/A");
           }
 
+          lines.push("");
+          lines.push(`Shape color: ${EXPORT.meta.shapeColor}`);
           lines.push("");
 
           EXPORT.trials.forEach((t, i) => {
@@ -441,7 +465,7 @@
         await webgazer.begin();
 
         if (DEBUG) {
-          webgazer.showVideo(fals);
+          webgazer.showVideo(false);
           webgazer.showPredictionPoints(true);
         } else {
           webgazer.showVideo(false);
@@ -459,25 +483,21 @@
           ctx.fillStyle = "#f0f0f0";
           ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-          // outer ring
           ctx.beginPath();
           ctx.arc(x, y, r + 10, 0, Math.PI * 2);
           ctx.fillStyle = "#111";
           ctx.fill();
 
-          // inner cutout
           ctx.beginPath();
           ctx.arc(x, y, r + 3, 0, Math.PI * 2);
           ctx.fillStyle = "#f0f0f0";
           ctx.fill();
 
-          // center
           ctx.beginPath();
           ctx.arc(x, y, r, 0, Math.PI * 2);
           ctx.fillStyle = "#111";
           ctx.fill();
 
-          // tiny dot
           ctx.beginPath();
           ctx.arc(x, y, 4, 0, Math.PI * 2);
           ctx.fillStyle = "#f0f0f0";
@@ -588,7 +608,6 @@
           collected = [];
           collecting = false;
 
-          // warmup draw
           const startWarm = performance.now();
           while (performance.now() - startWarm < VAL_POINT_WARMUP_MS) {
             drawCalibrationTarget(targetX, targetY, performance.now() - startWarm);
@@ -686,11 +705,15 @@
             this.x = x;
             this.y = y;
             this.size = shapeSize;
-            this.color = colors[Math.floor(Math.random() * colors.length)];
             this.pathType = pathType;
             this.vx = 0;
             this.vy = 0;
             this.setFixedVelocity();
+            this.applyColor();
+          }
+
+          applyColor() {
+            this.color = currentShapeColor();
           }
 
           setFixedVelocity() {
@@ -777,10 +800,17 @@
         const shapes = [
           new Shape("square", canvas.width * 0.12, canvas.height * 0.18, "horizontal"),
           new Shape("circle", canvas.width * 0.45, canvas.height * 0.25, "vertical"),
-          // start triangle away from extreme corner
           new Shape("triangle", canvas.width * 0.64, canvas.height * 0.60, "diagonal"),
         ];
 
+        function applyColorToAllShapes() {
+          shapes.forEach((s) => s.applyColor());
+          EXPORT.meta.shapeColor = currentShapeColor();
+        }
+
+        // ----------------------------
+        // Scene + Trials
+        // ----------------------------
         let running = false;
         let targetIndex = 0;
         let currentTarget = null;
@@ -926,21 +956,65 @@
         }
 
         // ----------------------------
-        // Main flow
+        // Full run helper (so the button can rerun cleanly)
         // ----------------------------
-        drawScene();
-        animate();
+        let runInProgress = false;
 
-        await passiveCalibrationPass();
-        let v = await validationPass();
+        async function runFullTest() {
+          if (runInProgress) return;
+          runInProgress = true;
 
-        if (!v.ok) {
+          exportBox.style.display = "none";
+          setBanner("", false);
+
+          EXPORT = newExport();
+          applyColorToAllShapes();
+          drawScene();
+
           await passiveCalibrationPass();
-          v = await validationPass();
+          let v = await validationPass();
+
+          if (!v.ok) {
+            await passiveCalibrationPass();
+            v = await validationPass();
+          }
+
+          webgazer.showVideo(false);
+          webgazer.showPredictionPoints(DEBUG);
+
+          for (let i = 0; i < 6; i++) {
+            await runTrial();
+            await sleep(250);
+          }
+
+          setBanner("Done (showing results)", true);
+          await sleep(300);
+
+          showExport();
+          setBanner("", false);
+
+          runInProgress = false;
         }
 
-        webgazer.showVideo(false);
-        webgazer.showPredictionPoints(DEBUG);
+        // ----------------------------
+        // Buttons
+        // ----------------------------
+        switchColorsBtn.addEventListener("click", async () => {
+          // rotate orange -> red -> purple
+          colorIndex = (colorIndex + 1) % colors.length;
+
+          // restart full test with the new color
+          exportBox.style.display = "none";
+          await sleep(60);
+          await runFullTest();
+        });
+
+        // ----------------------------
+        // Main flow
+        // ----------------------------
+        applyColorToAllShapes();
+        drawScene();
+        animate();
 
         setBanner("Click anywhere to start the test", true);
 
@@ -948,17 +1022,7 @@
           "click",
           async () => {
             setBanner("", false);
-
-            for (let i = 0; i < 6; i++) {
-              await runTrial();
-              await sleep(250);
-            }
-
-            setBanner("Done (showing results)", true);
-            await sleep(300);
-
-            showExport();
-            setBanner("", false);
+            await runFullTest();
           },
           { once: true }
         );
